@@ -82,7 +82,7 @@ static std::vector<int64_t> GetShape(Ort::Session& sess,
   return retval;
 }
 
-RequestExecutionFrame::RequestExecutionFrame(PipelineSession& psess,  // passing by non-const ref to create iobinding
+RequestExecutionFrame::RequestExecutionFrame(PipelineSession& psess,  // passing by non-const exec_frame to create iobinding
                                              int req_idx0,
                                              ReqId req_id0,
                                              int batch_size0,
@@ -103,36 +103,59 @@ RequestExecutionFrame::RequestExecutionFrame(PipelineSession& psess,  // passing
     auto& session = psess.model_session_state_vec[idx].session;
     auto cuda_allocator = std::make_unique<Ort::Allocator>(session, cuda_mem_info);
 
-    // Pre-allocate memory for both input and output states
+    // Pre-allocate memory for both present and past states
     // Calcuate the amount of memory to allocate
-    // For now assume all state inputs/outputs have the same shape and the same indices for batch and seq dimension
+    // For now assume all present and past states have the same shape and the same indices for batch and seq dimension
     // This allows us to calculate the shape only once.
-    auto rc = Contains(mcfg.input_names, mcfg.state_input_names[0]);
+    auto rc = Contains(mcfg.input_names, mcfg.past_input_names[0]);
     assert(rc.first);
     auto io_idx = rc.second;
-    auto state_shape = GetShape(session, io_idx, true);
+    auto past_present_state_shape = GetShape(session, io_idx, true);
     // override batch and seq dims with batch_size and maximum seq len
-    state_shape[mcfg.batch_dim_index_in_state] = batch_size;
-    state_shape[mcfg.seq_len_dim_index_in_state] = psess.pcfg.max_seq_len;
-    auto num_elements = std::accumulate(std::begin(state_shape), std::end(state_shape), 1, std::multiplies<int>());
+    past_present_state_shape[mcfg.batch_dim_index_in_state] = batch_size;
+    past_present_state_shape[mcfg.seq_len_dim_index_in_state] = psess.pcfg.max_seq_len;
+    auto num_elements = std::accumulate(std::begin(past_present_state_shape), std::end(past_present_state_shape), 1, std::multiplies<int>());
     int size_to_allocate = sizeof(Ort::Float16_t) * num_elements;  // TODO don't hardcode type
 
     // pre-allocate buffers for input and output states
-    for (const auto& name : mcfg.state_input_names) {
-      rs.state_buffer_1_vec.push_back(cuda_allocator->GetAllocation(size_to_allocate));
-      rs.state_buffer_2_vec.push_back(cuda_allocator->GetAllocation(size_to_allocate));
+    for (const auto& name : mcfg.past_input_names) {
+      rs.present_past_prealloc_buffer_1_vec.push_back(cuda_allocator->GetAllocation(size_to_allocate));
+      rs.present_past_prealloc_buffer_2_vec.push_back(cuda_allocator->GetAllocation(size_to_allocate));
     }
 
     // initialize the output states
     // intentionally 0 since when the model is run the first time, there's no past state to feed.
-    state_shape[mcfg.seq_len_dim_index_in_state] = 0;
-    for (int j = 0, end = mcfg.state_output_names.size(); j < end; ++j) {
-      const auto& oname = mcfg.state_output_names[j];
-      auto& mem_allocation = rs.state_buffer_1_vec[j];  // careful, use buffer1 here
+    past_present_state_shape[mcfg.seq_len_dim_index_in_state] = 0;
+    for (int j = 0, end = mcfg.present_output_names.size(); j < end; ++j) {
+      const auto& oname = mcfg.present_output_names[j];
+      auto& mem_allocation = rs.present_past_prealloc_buffer_1_vec[j];  // careful, use buffer1 here
       auto ort_val = Ort::Value::CreateTensor(
           cuda_mem_info, mem_allocation.get(), mem_allocation.size(),
-          state_shape.data(), state_shape.size(), ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16);  // TODO remove hardcoded type
+          past_present_state_shape.data(), past_present_state_shape.size(), ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16);  // TODO remove hardcoded type
       rs.output_val_map.emplace(oname, std::move(ort_val));
+    }
+
+    // it's inefficient to allocate memory for the inter stage outputs for every step
+    // pre-allocate buffers for inter stage outputs except the last stage
+    if (idx < psess.pcfg.num_stages - 1) {
+      for (const auto& elem_pair : mcfg.inter_stage_output_input_map) {
+        // get the shape of the output name
+        const auto& oname = elem_pair.first;
+        auto rc = Contains(mcfg.output_names, oname);
+        assert(rc.first);
+        auto output_shape = GetShape(session, rc.second, false /*output*/);
+
+        // replace seq_len dim with max_seq_len
+        output_shape[mcfg.batch_dim_in_inter_stage_output] = batch_size;
+        output_shape[mcfg.seq_len_dim_in_inter_stage_output] = psess.pcfg.max_seq_len;
+
+        // get the total number of bytes to allocate
+        auto num_elements = std::accumulate(std::begin(output_shape), std::end(output_shape), 1, std::multiplies<int>());
+        int size_to_allocate = sizeof(Ort::Float16_t) * num_elements;  // TODO don't hardcode type
+
+        // allocate and store in map
+        rs.inter_stage_output_prealloc_buffer_map.emplace(oname, cuda_allocator->GetAllocation(size_to_allocate));
+      }
     }
 
     rs.io_binding = std::make_unique<Ort::IoBinding>(psess.model_session_state_vec[idx].session);
@@ -144,33 +167,37 @@ RequestExecutionFrame::RequestExecutionFrame(PipelineSession& psess,  // passing
 }
 
 static ReqId CreateRequestId() {
-  using namespace std::chrono;
-  return duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
+  static int req_id;
+  return ++req_id;
+  // using namespace std::chrono;
+  // return duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
 }
 
 struct RequestProcessor {
-  std::shared_ptr<Token> ProcessRequest(const Token& token,
-                                        PipelineSession& psess /* passed by ref or else sess.Run won't work as Run is non-const */,
-                                        RequestExecutionFrame& exec_frame /* pass by non-const ref intentional as we'll update the state */) {
+  Token* ProcessRequest(Token& token,
+                        const PipelineConfig::ModelConfig& mcfg,
+                        PipelineSession::SessionState& session_state,
+                        RequestExecutionFrame& exec_frame /* pass by non-const exec_frame intentional as we'll update the state */) {
     std::ostringstream ostr;
     ostr << "Executing req_id(" << token.req_id << ")/step(" << token.step_id << ")/stage(" << exec_frame.stage_id << ")";
     const std::string& str = ostr.str();
     std::cout << str << "\n";
     Timer t(str.c_str());
 
-    const auto model_idx = exec_frame.stage_id;
-    const auto& mcfg = psess.pcfg.model_config_vec[model_idx];
-    auto& session_state = psess.model_session_state_vec[model_idx];
-    auto& ort_sess = session_state.session;
-
+    int model_idx = exec_frame.stage_id;
     RequestExecutionFrame::RunState& run_state = exec_frame.model_run_state_vec[model_idx];
 
     // set the GPU device id for this thread
     CheckStatus(g_ort->SetCurrentGpuDeviceId(mcfg.device_id));
 
-    auto out_token_ptr = std::make_shared<Token>();
-    out_token_ptr->step_id = token.step_id;
-    out_token_ptr->req_id = token.req_id;
+    // reuse the token; move the things out of this token since we'll overwrite them
+    auto* out_token_ptr = &token;
+    auto in_token_ort_value_names = token.ort_value_names;
+    std::vector<Ort::Value> in_token_ort_values;
+    in_token_ort_values.reserve(token.ort_values.size());
+    for (auto& v : token.ort_values) {
+      in_token_ort_values.push_back(std::move(v));
+    }
 
     auto& io_binding = *run_state.io_binding;
     io_binding.ClearBoundInputs();
@@ -179,19 +206,19 @@ struct RequestProcessor {
     // inputs
     // go through all the inputs from the config and for each one if you find it in token.input_names
     // use the value from there.
-    // else search this input name inside state_input_names. If found, get the corresponding output name from
-    // state_output_names and the OrtValue associated with it.
+    // else search this input name inside past_input_names. If found, get the corresponding output name from
+    // present_output_names and the OrtValue associated with it.
     for (const auto& iname : mcfg.input_names) {
-      auto rc = Contains(token.ort_value_names, iname);
+      auto rc = Contains(in_token_ort_value_names, iname);
       if (rc.first) {
         // std::cout << stage_id << "/" << token.step_id << " binding input " << token.ort_value_names[rc.second] << "\n";
-        io_binding.BindInput(iname.c_str(), token.ort_values[rc.second]);
+        io_binding.BindInput(iname.c_str(), in_token_ort_values[rc.second]);
         continue;
       }
 
-      rc = Contains(mcfg.state_input_names, iname);
+      rc = Contains(mcfg.past_input_names, iname);
       if (rc.first) {
-        const auto& mapped_oname = mcfg.state_output_names[rc.second];
+        const auto& mapped_oname = mcfg.present_output_names[rc.second];
         // std::cout << stage_id << "/" << token.step_id << " state_binding " << iname << " with value of " << mapped_oname << "\n";
         io_binding.BindInput(iname.c_str(),
                              run_state.output_val_map.at(mapped_oname));
@@ -204,42 +231,44 @@ struct RequestProcessor {
     // if output is not a state, bind using just cuda_mem_info.
 
     // get seq len of input_ids (stage 0) or input_hidden_states (stage 1)
-    auto rc = Contains(token.ort_value_names, mcfg.input_to_use_for_seq_len);
+    auto rc = Contains(in_token_ort_value_names, mcfg.input_to_use_for_seq_len);
     assert(rc.first);  // TODO
-    const auto& input_ort_value = token.ort_values[rc.second];
+    const auto& input_ort_value = in_token_ort_values[rc.second];
     int input_seq_len = input_ort_value.GetTensorTypeAndShapeInfo().GetShape()[mcfg.seq_len_dim_index_in_input];
 
     // get past seq len
     // assume past_seq_len is same for all states
-    int past_seq_len = run_state.output_val_map.at(mcfg.state_output_names[0])
+    int past_seq_len = run_state.output_val_map.at(mcfg.present_output_names[0])
                            .GetTensorTypeAndShapeInfo()
                            .GetShape()[mcfg.seq_len_dim_index_in_state];
 
     // new seq len for state output = seq len of input_ids + past_seq_len
     int new_seq_len = input_seq_len + past_seq_len;
 
+    auto& ort_sess = session_state.session;
+
     // populate shape for state outputs
     // assume same shape for all outputs
-    auto rc2 = Contains(mcfg.output_names, mcfg.state_output_names[0]);
+    auto rc2 = Contains(mcfg.output_names, mcfg.present_output_names[0]);
     assert(rc2.first);
     auto out_idx = rc2.second;
-    auto state_shape = GetShape(ort_sess, out_idx, false /*output*/);
-    state_shape[mcfg.batch_dim_index_in_state] = exec_frame.batch_size;
-    state_shape[mcfg.seq_len_dim_index_in_state] = new_seq_len;
+    auto past_present_state_shape = GetShape(ort_sess, out_idx, false /*output*/);
+    past_present_state_shape[mcfg.batch_dim_index_in_state] = exec_frame.batch_size;
+    past_present_state_shape[mcfg.seq_len_dim_index_in_state] = new_seq_len;
 
     // assume types are same for all states
-    auto out_type = ort_sess.GetOutputTypeInfo(out_idx).GetTensorTypeAndShapeInfo().GetElementType();
+    auto past_present_type = ort_sess.GetOutputTypeInfo(out_idx).GetTensorTypeAndShapeInfo().GetElementType();
 
     for (const auto& oname : mcfg.output_names) {
-      auto rc = Contains(mcfg.state_output_names, oname);
+      auto rc = Contains(mcfg.present_output_names, oname);
       if (rc.first) {
         auto& mem_allocation = token.step_id % 2 == 0  // even: use buffer1 for input and buffer2 for output
-                                   ? run_state.state_buffer_2_vec[rc.second]
-                                   : run_state.state_buffer_1_vec[rc.second];
+                                   ? run_state.present_past_prealloc_buffer_2_vec[rc.second]
+                                   : run_state.present_past_prealloc_buffer_1_vec[rc.second];
         // cout << "mem allocation size: " << mem_allocation.size() << "\n";
         auto output_ort_val = Ort::Value::CreateTensor(
             session_state.cuda_mem_info, mem_allocation.get(), mem_allocation.size(),
-            state_shape.data(), state_shape.size(), out_type);
+            past_present_state_shape.data(), past_present_state_shape.size(), past_present_type);
         // std::cout << "step(" << token.step_id << ") / stage(" << exec_frame.stage_id << ")"
         //           << " created tensor for " << oname << "\n";
         io_binding.BindOutput(oname.c_str(), output_ort_val);
@@ -258,8 +287,21 @@ struct RequestProcessor {
             const auto& ort_val = exec_frame.ort_resp.output_values[rc.second];
             io_binding.BindOutput(oname.c_str(), ort_val);
           }
-        } else {
-          io_binding.BindOutput(oname.c_str(), session_state.cuda_mem_info);  // hidden_states
+        } else {  // inter stage outputs (e.g. hidden_states)
+          // get shape of oname
+          auto found = Contains(mcfg.output_names, oname);
+          assert(found.first);
+          auto inter_stage_output_shape = GetShape(ort_sess, found.second, false /*output*/);
+
+          // replace batch_size and seq_len
+          inter_stage_output_shape[mcfg.batch_dim_in_inter_stage_output] = exec_frame.batch_size;
+          inter_stage_output_shape[mcfg.seq_len_dim_in_inter_stage_output] = input_seq_len;  // TODO? verify?
+
+          auto& mem_allocation = run_state.inter_stage_output_prealloc_buffer_map.at(oname);
+          auto inter_stage_ort_val = Ort::Value::CreateTensor(
+              session_state.cuda_mem_info, mem_allocation.get(), mem_allocation.size(),
+              inter_stage_output_shape.data(), inter_stage_output_shape.size(), past_present_type);
+          io_binding.BindOutput(oname.c_str(), inter_stage_ort_val);
         }
       }
     }
@@ -281,27 +323,30 @@ struct RequestProcessor {
 
       // Assume that the same output name is not present in both the state that needs to be kept
       // and that needs to be passed on to the next layer.
-      auto is_loop_back_state_output = Contains(mcfg.state_output_names, oname);
-      assert(!(is_loop_back_state_output.first && mcfg.output_input_map.count(oname)));
+      auto is_loop_back_state_output = Contains(mcfg.present_output_names, oname);
+      assert(!(is_loop_back_state_output.first && mcfg.inter_stage_output_input_map.count(oname)));
 
-      // if this output is present in state_output_names, store it in model_run_state_vec
+      // if this output is present in present_output_names, store it in model_run_state_vec
       // because we don't want to store all outputs
       if (is_loop_back_state_output.first) {
         // std::cout << "step(" << token.step_id << ") / stage(" << exec_frame.stage_id << ")"
         //           << " saving state " << oname << "\n";
+        assert(vec_out_vals[i].GetTensorData<Ort::Float16_t>());
         run_state.output_val_map.emplace(oname, std::move(vec_out_vals[i]));
         continue;
       }
 
       // only pass those outputs to the next layer for which there is a config in the ensemble
       // other outputs are states to be used in the next run
-      if (mcfg.output_input_map.count(oname)) {
+      if (mcfg.inter_stage_output_input_map.count(oname)) {
         std::cout << "Copying output req_id(" << token.req_id << ")/step(" << token.step_id << ")/stage(" << exec_frame.stage_id << ") "
-                  << mcfg.output_input_map.at(oname) << "\n";
-        out_token_ptr->ort_value_names.push_back(mcfg.output_input_map.at(oname));  // input_hidden_states
+                  << mcfg.inter_stage_output_input_map.at(oname) << "\n";
+        out_token_ptr->ort_value_names.push_back(mcfg.inter_stage_output_input_map.at(oname));  // input_hidden_states
+        assert(vec_out_vals[i].GetTensorData<Ort::Float16_t>());
         out_token_ptr->ort_values.push_back(std::move(vec_out_vals[i]));
       }
     }
+
     std::cout << "Done executing req_id(" << token.req_id << ")/step(" << token.step_id << ")/stage(" << exec_frame.stage_id << ")"
               << "\n";
     return out_token_ptr;
@@ -353,33 +398,33 @@ static void GetNewInputIdsFromLogits(int batch_size,
 }
 
 // TODO proper error handling
-// TODO - token memory can be optimized; may not need to allocate every single time; also avoid shared_ptr
 // TODO - replace all cout with LOG
 // For simplicity even if one req in the batch fails, we consider the full batch to have failed.
 OrtStatus* PipelineSession::Run(/*const*/ std::vector<OrtReq>& req_list, std::vector<OrtResp>& resp_list, int num_steps) {
-  ResponseQueue<std::shared_ptr<Token>> resp_queue;
+  ResponseQueue<Token*> resp_queue;
   std::unordered_map<ReqId, RequestExecutionFrame> req_frame_map;
 
   // code that will run by the threads in the threadpool
-  auto lambda_helper = [](ResponseQueue<std::shared_ptr<Token>>& resp_queue,
+  auto lambda_helper = [](ResponseQueue<Token*>& resp_queue,
                           RequestProcessor& rp,
-                          const Token& token,
-                          PipelineSession& psess,
-                          RequestExecutionFrame& ref) {
-    std::shared_ptr<Token> out_token_ptr;
+                          Token& token,
+                          const PipelineConfig::ModelConfig& mcfg,
+                          PipelineSession::SessionState& session_state,
+                          RequestExecutionFrame& exec_frame) {
+    Token* out_token_ptr = nullptr;
     try {
-      out_token_ptr = rp.ProcessRequest(token, psess, ref);
+      out_token_ptr = rp.ProcessRequest(token, mcfg, session_state, exec_frame);
     } catch (const std::exception& e) {
       std::ostringstream error;
       error << "Error in processing request id: " << token.req_id << " with exception: " << e.what();
-      out_token_ptr = std::make_shared<Token>();
+      out_token_ptr = &exec_frame.token;
       out_token_ptr->req_id = token.req_id;
       out_token_ptr->step_id = token.step_id;
       out_token_ptr->error_msg = error.str();
     } catch (...) {
       std::ostringstream error;
       error << "Error in processing request id: " << token.req_id << " with unknown exception";
-      out_token_ptr = std::make_shared<Token>();
+      out_token_ptr = &exec_frame.token;
       out_token_ptr->req_id = token.req_id;
       out_token_ptr->step_id = token.step_id;
       out_token_ptr->error_msg = error.str();
@@ -414,16 +459,19 @@ OrtStatus* PipelineSession::Run(/*const*/ std::vector<OrtReq>& req_list, std::ve
 
     // create and store RequestExecutionFrame
     int stage_id = 0;
-    RequestExecutionFrame ref(*this, req_idx, req_id, batch_size, orig_seq_len, stage_id, one_resp);
-    req_frame_map.emplace(req_id, std::move(ref));
+    RequestExecutionFrame tmp_exec_frame(*this, req_idx, req_id, batch_size, orig_seq_len, stage_id, one_resp);
+    req_frame_map.emplace(req_id, std::move(tmp_exec_frame));
 
     // enqueue request
     int step_id = 0;
     // TODO don't move the input values
-    auto in_token_ptr = std::shared_ptr<Token>(new Token{req_id, step_id, one_req.input_names,
-                                                         std::move(one_req.input_values)});
-    auto lambda = [this, &lambda_helper, &resp_queue, &rp, in_token_ptr, &req_frame_map, req_id]() {
-      lambda_helper(resp_queue, rp, *in_token_ptr, *this, req_frame_map.at(req_id));
+    auto* in_token_ptr = &req_frame_map.at(req_id).token;
+    in_token_ptr->Init(req_id, step_id, one_req.input_names, std::move(one_req.input_values));
+    auto& exec_frame = req_frame_map.at(req_id);
+    const auto& model_config = pcfg.model_config_vec[stage_id];
+    auto& session_state = model_session_state_vec[stage_id];
+    auto lambda = [&model_config, &session_state, &lambda_helper, &resp_queue, &rp, in_token_ptr, &exec_frame]() {
+      lambda_helper(resp_queue, rp, *in_token_ptr, model_config, session_state, exec_frame);
     };
     std::function<void()> task(lambda);
     tp.RunTask(std::move(task));
@@ -496,8 +544,8 @@ OrtStatus* PipelineSession::Run(/*const*/ std::vector<OrtReq>& req_list, std::ve
 
         // update position ids
         // assume shape of position ids is same as input_ids
-        int new_seq_len = exec_frame.orig_input_seq_len + step_id - 1;
-        std::vector<int64_t> posn_ids(batch_size, new_seq_len);
+        int new_posn_id = exec_frame.orig_input_seq_len + step_id - 1;
+        std::vector<int64_t> posn_ids(batch_size, new_posn_id);
         auto posn_ids_tensor = Ort::Value::CreateTensor<int64_t>(cpu_memory_info, posn_ids.data(), posn_ids.size(),
                                                                  input_ids_shape.data(), input_ids_shape.size());  // TODO don't hardcode type
 
@@ -517,8 +565,10 @@ OrtStatus* PipelineSession::Run(/*const*/ std::vector<OrtReq>& req_list, std::ve
     }
 
     // re-enqueue request
-    auto lambda = [this, &lambda_helper, &resp_queue, &rp, token_ptr, &req_frame_map, req_id]() {
-      lambda_helper(resp_queue, rp, *token_ptr, *this, req_frame_map.at(req_id));
+    const auto& model_config = pcfg.model_config_vec[exec_frame.stage_id];
+    auto& session_state = model_session_state_vec[exec_frame.stage_id];
+    auto lambda = [&model_config, &session_state, &lambda_helper, &resp_queue, &rp, token_ptr, &exec_frame]() {
+      lambda_helper(resp_queue, rp, *token_ptr, model_config, session_state, exec_frame);
     };
     std::function<void()> task(lambda);
     tp.RunTask(std::move(task));
@@ -550,29 +600,31 @@ void PipelineSession::ParseEnsembleJsonFile(const std::string& ensemble_json_fil
     cfg.batch_dim_index_in_input = m["batch_dim_index_in_input"];
     cfg.batch_dim_index_in_state = m["batch_dim_index_in_state"];
     cfg.seq_len_dim_index_in_state = m["seq_len_dim_index_in_state"];
+    cfg.seq_len_dim_in_inter_stage_output = m["seq_len_dim_in_inter_stage_output"];
+    cfg.batch_dim_in_inter_stage_output = m["batch_dim_in_inter_stage_output"];
     cfg.device_id = m["device_id"];
 
-    const char* key = "output_input_map";
+    const char* key = "inter_stage_output_input_map";
     if (m.find(key) != m.end()) {
       const auto& j_oi_map = m[key];
       for (const auto& elem : j_oi_map) {
-        cfg.output_input_map[elem[0]] = elem[1];
+        cfg.inter_stage_output_input_map[elem[0]] = elem[1];
       }
     }
 
-    key = "state_input_names";
+    key = "past_input_names";
     if (m.find(key) != m.end()) {
       const auto& si_names = m[key];
       for (const auto& elem : si_names) {
-        cfg.state_input_names.push_back(elem);
+        cfg.past_input_names.push_back(elem);
       }
     }
 
-    key = "state_output_names";
+    key = "present_output_names";
     if (m.find(key) != m.end()) {
       const auto& so_names = m[key];
       for (const auto& elem : so_names) {
-        cfg.state_output_names.push_back(elem);
+        cfg.present_output_names.push_back(elem);
       }
     }
 
@@ -589,15 +641,16 @@ bool PipelineSession::Validate(const PipelineConfig& pcfg) {
   return true;
 }
 
-PipelineSession::PipelineSession(const std::string& ensemble_json_file, Ort::Env& env) : tp(10) {
-  Timer t("PipelineSession ctor");
+PipelineSession::PipelineSession(const std::string& ensemble_json_file, int thread_pool_size, Ort::Env& env)
+    : tp(thread_pool_size) {
   ParseEnsembleJsonFile(ensemble_json_file, pcfg);
   auto rc = Validate(pcfg);
   assert(rc);
   Init(pcfg, env);
 }
 
-PipelineSession::PipelineSession(const PipelineConfig& ens0, Ort::Env& env) : pcfg(ens0), tp(10) {
+PipelineSession::PipelineSession(const PipelineConfig& ens0, int thread_pool_size, Ort::Env& env)
+    : pcfg(ens0), tp(thread_pool_size) {
   auto rc = Validate(pcfg);
   assert(rc);
   Init(pcfg, env);
@@ -610,7 +663,9 @@ void PipelineSession::Init(PipelineConfig& pcfg, Ort::Env& env) {
     CheckStatus(OrtSessionOptionsAppendExecutionProvider_CUDA(session_options, mcfg.device_id));
     Ort::Session session{nullptr};
     {
-      Timer t(mcfg.model_name.c_str());
+      std::string session_time_msg = mcfg.model_name;
+      session_time_msg.append(" session creation");
+      Timer t(session_time_msg.c_str());
       Ort::Session sess_tmp(env, mcfg.model_file_path.c_str(), session_options);
       session = std::move(sess_tmp);
     }
@@ -663,7 +718,7 @@ int main(int argc, char* argv[]) {
   std::unique_ptr<PipelineSession> pipeline_session_ptr = nullptr;
   {
     Timer t("Creating PipelineSession");
-    pipeline_session_ptr = std::make_unique<PipelineSession>(ensemble_file_name, env);
+    pipeline_session_ptr = std::make_unique<PipelineSession>(ensemble_file_name, 10, env);
   }
   PipelineSession& pipeline_session = *pipeline_session_ptr;
 
@@ -737,10 +792,11 @@ int main(int argc, char* argv[]) {
     std::cout << "Printing output "
               << "\n";
     for (int i = 0; i < num_elems; i += 10000) {
-      std::cout << "elem: " << data_ptr[i] << "\n";
+      std::cout << "elem: " << data_ptr[i].operator uint16_t() << "\n";
     }
     std::cout << "\n";
   }
+
   printf("Done!\n");
   return 0;
 }

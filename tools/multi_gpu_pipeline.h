@@ -15,18 +15,20 @@ struct PipelineConfig {
   struct ModelConfig {
     std::string model_name;
     std::string model_file_path;
-    std::vector<std::string> input_names;   // same order as model
-    std::vector<std::string> output_names;  // same order as model
-    std::unordered_map<std::string, std::string> output_input_map;  // maps output of this step to input of the next step in the pipeline
-    // state_input_names and state_output_names should have 1-1 correspondence
-    std::vector<std::string> state_input_names;   // names of inputs whose values come from the previous output
-    std::vector<std::string> state_output_names;  // names of outputs that feed the next inputs
+    std::vector<std::string> input_names;                                       // same order as model
+    std::vector<std::string> output_names;                                      // same order as model
+    std::unordered_map<std::string, std::string> inter_stage_output_input_map;  // maps output of this step to input of the next step in the pipeline
+    // past_input_names and present_output_names should have 1-1 correspondence
+    std::vector<std::string> past_input_names;      // names of inputs whose values come from the previous output
+    std::vector<std::string> present_output_names;  // names of outputs that feed the next inputs
     int device_id;
     int batch_dim_index_in_state;
     int batch_dim_index_in_input;
     int seq_len_dim_index_in_state;
     std::string input_to_use_for_seq_len;
     int seq_len_dim_index_in_input;
+    int batch_dim_in_inter_stage_output;
+    int seq_len_dim_in_inter_stage_output;
   };
 
   int max_seq_len;
@@ -49,6 +51,30 @@ struct OrtResp {
   std::vector<OrtMemoryInfo*> output_meminfo;  // specify location of outputs or null for preallocated
 };
 
+struct Token {
+  void Clear() {
+    ort_value_names.clear();
+    ort_values.clear();
+    error_msg.clear();
+    req_id = -1;
+    step_id = -1;
+  }
+
+  void Init(ReqId req_id0, int step_id0, const std::vector<std::string>& ort_value_names0,
+            std::vector<Ort::Value>&& ort_values0) {
+    req_id = req_id0;
+    step_id = step_id0;
+    ort_value_names = ort_value_names0;
+    ort_values = std::move(ort_values0);
+  }
+
+  ReqId req_id;
+  int step_id;
+  std::vector<std::string> ort_value_names;
+  std::vector<Ort::Value> ort_values;
+  std::string error_msg;
+};
+
 struct PipelineSession;
 struct RequestExecutionFrame {
   RequestExecutionFrame(PipelineSession& psess,
@@ -67,9 +93,10 @@ struct RequestExecutionFrame {
     // are getting executed in parallel
     std::unique_ptr<Ort::Allocator> cuda_allocator;
     std::unordered_map<std::string, Ort::Value> output_val_map;  // (present_00..) output generated after running a stage
-    // pre-allocated on cuda; order should be same as ModelConfig::state_output_names/state_input_names
-    std::vector<Ort::MemoryAllocation> state_buffer_1_vec;
-    std::vector<Ort::MemoryAllocation> state_buffer_2_vec;
+    // pre-allocated on cuda; order should be same as ModelConfig::present_output_names/past_input_names
+    std::vector<Ort::MemoryAllocation> present_past_prealloc_buffer_1_vec;
+    std::vector<Ort::MemoryAllocation> present_past_prealloc_buffer_2_vec;
+    std::unordered_map<std::string, Ort::MemoryAllocation> inter_stage_output_prealloc_buffer_map;
   };
 
   const int req_index;
@@ -79,29 +106,14 @@ struct RequestExecutionFrame {
   int stage_id;  // stage to be executed; stage_id can be used as an index into model_run_state_vec
   std::vector<RunState> model_run_state_vec;
   OrtResp& ort_resp;
-};
-
-struct Token {
-  void Clear() {
-    ort_value_names.clear();
-    ort_values.clear();
-    error_msg.clear();
-    req_id = -1;
-    step_id = -1;
-  }
-
-  int64_t req_id;
-  int step_id;
-  std::vector<std::string> ort_value_names;
-  std::vector<Ort::Value> ort_values;
-  std::string error_msg;
+  Token token;
 };
 
 struct PipelineSession {
   OrtStatus* Run(std::vector<OrtReq>& req_vec, std::vector<OrtResp>& resp_vec, int max_steps);
   void ParseEnsembleJsonFile(const std::string& ensemble_json_file, PipelineConfig& ens);
-  PipelineSession(const std::string& ensemble_json_file, Ort::Env& env);
-  PipelineSession(const PipelineConfig& ens, Ort::Env& env);
+  PipelineSession(const std::string& ensemble_json_file, int thread_pool_size, Ort::Env& env);
+  PipelineSession(const PipelineConfig& ens, int thread_pool_size, Ort::Env& env);
   void Init(PipelineConfig& ens0, Ort::Env& env);
   bool Validate(const PipelineConfig& ens);
 
