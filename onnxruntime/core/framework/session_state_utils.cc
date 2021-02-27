@@ -31,7 +31,7 @@ namespace onnxruntime {
 namespace session_state_utils {
 
 static common::Status DeserializeTensorProto(const Env& env, const std::basic_string<PATH_CHAR_TYPE>& proto_path,
-                                             const ONNX_NAMESPACE::TensorProto& tensor_proto, const MemBuffer& m,
+                                             const ONNX_NAMESPACE::TensorProto& tensor_proto, MemBuffer& m,
                                              const OrtMemoryInfo& default_cpu_memory_info, OrtValue& ort_value,
                                              OrtCallback& deleter,
                                              const DataTransferManager& data_transfer_mgr) {
@@ -63,9 +63,9 @@ static common::Status DeserializeTensorProto(const Env& env, const std::basic_st
   std::unique_ptr<Tensor> p_tensor;
   OrtValue tmp_ort_value;
   OrtCallback d;
+  MemBuffer tbuf(data.get(), cpu_tensor_length, default_cpu_memory_info);
   ORT_RETURN_IF_ERROR(utils::TensorProtoToMLValue(env, proto_path.c_str(), tensor_proto,
-                                                  MemBuffer(data.get(), cpu_tensor_length, default_cpu_memory_info),
-                                                  tmp_ort_value, d));
+                                                  tbuf, tmp_ort_value, d));
 
   const Tensor& p_deserialize_tensor = tmp_ort_value.Get<Tensor>();
 
@@ -117,8 +117,8 @@ common::Status SaveInitializedTensors(
       if (!ort_value_name_idx_map.GetIdx(name, ort_value_index).IsOK()) {
         retval = false;
       } else {
-        auto planned_mem_info = exec_plan.GetLocation(ort_value_index);
-        auto user_mem_info = it->second->Get<Tensor>().Location();
+        const auto& planned_mem_info = exec_plan.GetLocation(ort_value_index);
+        const auto& user_mem_info = it->second->Get<Tensor>().Location();
         retval = user_mem_info.device == planned_mem_info.device;
         if (!retval) {
           LOGS(logger, WARNING) << "Cannot use user supplied initializer with name: ("

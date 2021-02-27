@@ -72,6 +72,18 @@ class Tensor final {
          ptrdiff_t offset = 0);
 
   /**
+   * Create tensor with given type, shape, pre-allocated memory and the allocator. 
+   * This version transfer the buffer ownership to the tensor.
+   * This function won't check if the preallocated buffer(p_data) has enough room for the shape.
+   * \param data A preallocated buffer. Can be NULL if the shape is empty.
+   *              Tensor ownes the data and will delete it
+   * \param offset Offset in bytes to start of Tensor within p_data. 
+   * \param deleters  functions for cleaning up and releasing buffer
+  */
+  Tensor(MLDataType p_type, const TensorShape& shape, void* p_data, ptrdiff_t offset, 
+         const OrtMemoryInfo& alloc, std::vector<std::function<void(void)>>&& deleters);
+
+  /**
    * Deprecated. The orginal design is this Tensor class won't do any allocation / release.
    * However, this function will allocate the buffer for the shape, and do placement new if p_type is string tensor.
    */
@@ -180,7 +192,7 @@ class Tensor final {
   }
 
   bool OwnsBuffer() const noexcept {
-    return buffer_deleter_ != nullptr;
+    return ! deleters_.empty();
   }
 
   /**
@@ -228,17 +240,12 @@ class Tensor final {
   void ReleaseBuffer();
 
   void* p_data_;
-  /**
-     if buffer_deleter_ is null, it means tensor does not own the buffer.
-     otherwise tensor will use the deleter to release the buffer when
-     tensor is released.
-  */
-  AllocatorPtr buffer_deleter_;
 
   TensorShape shape_;
   const PrimitiveDataTypeBase* dtype_;
   OrtMemoryInfo alloc_info_;
   ptrdiff_t byte_offset_;
+  std::vector<std::function<void(void)>> deleters_;
 };
 #ifdef __GNUC__
 #pragma GCC diagnostic pop

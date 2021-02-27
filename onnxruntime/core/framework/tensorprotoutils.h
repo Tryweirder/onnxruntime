@@ -39,7 +39,7 @@ TensorShape GetTensorShapeFromTensorShapeProto(const ONNX_NAMESPACE::TensorShape
  *                        relative path or an absolute path.
  */
 common::Status TensorProtoToMLValue(const Env& env, const ORTCHAR_T* tensor_proto_path,
-                                    const ONNX_NAMESPACE::TensorProto& input, const MemBuffer& m, OrtValue& value,
+                                    const ONNX_NAMESPACE::TensorProto& input, MemBuffer& m, OrtValue& value,
                                     OrtCallback& deleter);
 
 /** Creates a TensorProto from a Tensor.

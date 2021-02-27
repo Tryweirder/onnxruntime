@@ -20,6 +20,7 @@
 #include "core/platform/path_lib.h"
 #include "core/session/ort_apis.h"
 #include "onnx/defs/tensor_proto_util.h"
+#include "onnx/common/ir.h"
 
 using namespace ONNX_NAMESPACE;
 using namespace ::onnxruntime::common;
@@ -615,7 +616,7 @@ static void MoveOrtCallback(OrtCallback& from, OrtCallback& to) {
 // TODO: Change the current interface to take Path object for model path
 // so that validating and manipulating path for reading external data becomes easy
 Status TensorProtoToMLValue(const Env& env, const ORTCHAR_T* model_path,
-                            const ONNX_NAMESPACE::TensorProto& tensor_proto, const MemBuffer& m, OrtValue& value,
+                            const ONNX_NAMESPACE::TensorProto& tensor_proto, MemBuffer& m, OrtValue& value,
                             OrtCallback& deleter) {
   const OrtMemoryInfo& allocator = m.GetAllocInfo();
   ONNXTensorElementDataType ele_type = utils::GetTensorElementType(tensor_proto);
@@ -725,10 +726,30 @@ Status TensorProtoToMLValue(const Env& env, const ORTCHAR_T* model_path,
   std::vector<int64_t> tensor_shape_vec = GetTensorShapeFromTensorProto(tensor_proto);
   // Note: We permit an empty tensor_shape_vec, and treat it as a scalar (a tensor of size 1).
   TensorShape tensor_shape{tensor_shape_vec};
+  std::vector<std::function<void(void)>> tensor_deleters;
+  ResourceGuard exitguard([&tensor_deleters]() {
+    for (const auto& d : tensor_deleters) {
+      d();
+    }
+  });
+
+  if (m.IsOwner()) {
+    // need to transfer buffer ownership to tensor
+    if (deleter.f != nullptr) {
+      // clean up should happen eariler than releasing buffer
+      tensor_deleters.push_back([deleter]() { deleter.f(deleter.param); });
+      //lambda used copy capture, should be safe to clear out deleter now
+      deleter.f = nullptr;
+      deleter.param = nullptr;
+    }
+    tensor_deleters.push_back([alloc(m.Release()), mbuf(m.GetBuffer())]() { alloc->Free(mbuf); });
+  }
+  ORT_ENFORCE(!m.IsOwner(), "MemBuffer ownership should be cleared after Tensor is created!");
 
   auto ml_tensor = DataTypeImpl::GetType<Tensor>();
-  value.Init(new Tensor(type, tensor_shape, tensor_data, allocator), ml_tensor,
+  value.Init(new Tensor(type, tensor_shape, tensor_data, 0, allocator, std::move(tensor_deleters)), ml_tensor,
              ml_tensor->GetDeleteFunc());
+  ORT_ENFORCE(tensor_deleters.empty(), "tensor deleters should be given to the tensor!");
   return Status::OK();
 }
 #ifdef _MSC_VER

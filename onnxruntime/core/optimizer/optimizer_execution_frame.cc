@@ -42,12 +42,10 @@ OptimizerExecutionFrame::Info::Info(const std::vector<const Node*>& nodes,
       std::unique_ptr<char[]> data(new char[cpu_tensor_length]);
       std::unique_ptr<Tensor> p_tensor;
       OrtCallback d;
+      MemBuffer tbuf(data.get(), cpu_tensor_length, allocator_ptr_->Info());
       ORT_RETURN_IF_ERROR(utils::TensorProtoToMLValue(Env::Default(),
                                                       model_path.IsEmpty() ? nullptr : model_path.ToPathString().c_str(),
-                                                      tensor_proto,
-                                                      MemBuffer(data.get(), cpu_tensor_length, allocator_ptr_->Info()),
-                                                      ort_value,
-                                                      d));
+                                                      tensor_proto, tbuf, ort_value, d));
 
       initializers_[idx] = ort_value;
       buffer_for_initialized_tensors_[idx] = std::move(data);

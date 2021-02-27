@@ -31,8 +31,9 @@ TEST(CApiTensorTest, load_simple_float_tensor_not_enough_space) {
   OrtValue value;
   auto deleter = onnxruntime::make_unique<onnxruntime::OrtCallback>();
   OrtMemoryInfo cpu_memory_info(onnxruntime::CPU, OrtDeviceAllocator, OrtDevice(), 0, OrtMemTypeDefault);
+  MemBuffer tbuf(output.data(), output.size() * sizeof(float), cpu_memory_info);
   auto st = utils::TensorProtoToMLValue(Env::Default(), nullptr, p,
-                                        MemBuffer(output.data(), output.size() * sizeof(float), cpu_memory_info), value, *deleter);
+                                        tbuf, value, *deleter);
   // check the result
   ASSERT_FALSE(st.IsOK());
   if (deleter->f) {
@@ -56,8 +57,9 @@ TEST(CApiTensorTest, load_simple_float_tensor) {
   OrtValue value;
   auto deleter = onnxruntime::make_unique<onnxruntime::OrtCallback>();
   OrtMemoryInfo cpu_memory_info(onnxruntime::CPU, OrtDeviceAllocator, OrtDevice(), 0, OrtMemTypeDefault);
+  MemBuffer tbuf(output.data(), output.size() * sizeof(float), cpu_memory_info);
   auto st = utils::TensorProtoToMLValue(Env::Default(), nullptr, p,
-                                        MemBuffer(output.data(), output.size() * sizeof(float), cpu_memory_info), value, *deleter);
+                                        tbuf, value, *deleter);
   ASSERT_TRUE(st.IsOK()) << st.ErrorMessage();
   float* real_output;
   auto ort_st = g_ort->GetTensorMutableData(&value, (void**)&real_output);
@@ -115,8 +117,9 @@ static void run_external_data_test() {
   OrtValue value;
   auto deleter = onnxruntime::make_unique<onnxruntime::OrtCallback>();
   OrtMemoryInfo cpu_memory_info(onnxruntime::CPU, OrtDeviceAllocator, OrtDevice(), 0, OrtMemTypeDefault);
+  MemBuffer tbuf(output.data(), output.size() * sizeof(float), cpu_memory_info);
   auto st = utils::TensorProtoToMLValue(Env::Default(), nullptr, p,
-                                        MemBuffer(output.data(), output.size() * sizeof(float), cpu_memory_info), value, *deleter);
+                                        tbuf, value, *deleter);
   ASSERT_TRUE(st.IsOK()) << st.ErrorMessage();
   float* real_output;
   auto ort_st = g_ort->GetTensorMutableData(&value, (void**)&real_output);

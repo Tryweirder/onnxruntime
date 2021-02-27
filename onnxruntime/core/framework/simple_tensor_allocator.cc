@@ -29,8 +29,7 @@ common::Status SimpleTensorAllocator::GetPreallocatedBuffer(int ort_value_index,
     return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Failed to get allocator for initializer '", name,
                            "', location: ", location.ToString());
   void* buffer = alloc->Alloc(len);
-  weights_buffers_.push_back(BufferUniquePtr(buffer, alloc));
-  out = onnxruntime::make_unique<MemBuffer>(buffer, len, location);
+  out = onnxruntime::make_unique<MemBuffer>(buffer, len, std::move(alloc));
   return Status::OK();
 }
 }  // namespace onnxruntime

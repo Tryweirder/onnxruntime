@@ -17,6 +17,13 @@ Tensor::Tensor(MLDataType p_type, const TensorShape& shape, void* p_data, const 
   Init(p_type, shape, p_data, nullptr, offset);
 }
 
+Tensor::Tensor(MLDataType p_type, const TensorShape& shape, void* p_data, ptrdiff_t offset,
+               const OrtMemoryInfo& alloc, std::vector<std::function<void(void)>>&& deleters)
+    : alloc_info_(alloc), deleters_(std::move(deleters)) {
+  ORT_ENFORCE(p_type != nullptr);
+  Init(p_type, shape, p_data, nullptr, offset);
+}
+
 Tensor::Tensor(MLDataType p_type, const TensorShape& shape, std::shared_ptr<IAllocator> allocator)
     : alloc_info_(allocator->Info()) {
   ORT_ENFORCE(p_type != nullptr);
@@ -31,6 +38,14 @@ Tensor::Tensor(MLDataType p_type, const TensorShape& shape, std::shared_ptr<IAll
       ORT_THROW("tensor failed memory size calculation");
 
     p_data = allocator->Alloc(len);
+  }
+
+  // for string tensors, do the placement new for strings on pre-allocated buffer.
+  if (utils::IsPrimitiveDataType<std::string>(p_type->AsPrimitiveDataType())) {
+    auto* ptr = static_cast<std::string*>(p_data);
+    for (int64_t i = 0, n = shape_size; i < n; ++i) {
+      new (ptr + i) std::string();
+    }
   }
 
   Init(p_type, shape, p_data, allocator);
@@ -54,29 +69,33 @@ void Tensor::Init(MLDataType p_type, const TensorShape& shape, void* p_raw_data,
   p_data_ = p_raw_data;
   // if caller passed in a deleter, that means this tensor own this buffer
   // we will release the buffer when this tensor is deconstructed.
-  buffer_deleter_ = std::move(deleter);
-  // for string tensors, if this tensor own the buffer (caller passed in the deleter)
-  // do the placement new for strings on pre-allocated buffer.
-  if (buffer_deleter_ && IsDataTypeString()) {
-    auto* ptr = static_cast<std::string*>(p_data_);
-    for (int64_t i = 0, n = shape_size; i < n; ++i) {
-      new (ptr + i) std::string();
-    }
+  if (deleter) {
+    deleters_.push_back([deleter, this]() {
+      if (IsDataTypeString()) {
+        using string = std::string;
+        auto* ptr = static_cast<std::string*>(p_data_);
+        int64_t len = shape_.Size();
+        for (int64_t i = 0; i < len; i++)
+          ptr[i].~string();
+      }
+      deleter->Free(p_data_);
+    });
+
   }
   byte_offset_ = offset;
 }
 
 Tensor::Tensor(Tensor&& other) noexcept
     : p_data_(other.p_data_),
-      buffer_deleter_(other.buffer_deleter_),
       shape_(other.shape_),
       dtype_(other.dtype_),
       alloc_info_(other.alloc_info_),
-      byte_offset_(other.byte_offset_) {
+      byte_offset_(other.byte_offset_),
+      deleters_(std::move(other.deleters_)) {
   other.dtype_ = DataTypeImpl::GetType<float>()->AsPrimitiveDataType();
   other.shape_ = TensorShape(std::vector<int64_t>(1, 0));
   other.p_data_ = nullptr;
-  other.buffer_deleter_ = nullptr;
+  other.deleters_.clear();
   other.byte_offset_ = 0;
 }
 
@@ -89,13 +108,13 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept {
     alloc_info_ = other.alloc_info_;
     byte_offset_ = other.byte_offset_;
     p_data_ = other.p_data_;
-    buffer_deleter_ = other.buffer_deleter_;
+    deleters_ = std::move(other.deleters_);
 
     other.dtype_ = DataTypeImpl::GetType<float>()->AsPrimitiveDataType();
     other.shape_ = TensorShape(std::vector<int64_t>(1, 0));
     other.p_data_ = nullptr;
     other.byte_offset_ = 0;
-    other.buffer_deleter_ = nullptr;
+    other.deleters_.clear();
   }
   return *this;
 }
@@ -105,18 +124,11 @@ Tensor::~Tensor() {
 }
 
 void Tensor::ReleaseBuffer() {
-  if (buffer_deleter_) {
-    // if current tensor is responsible for deleting the buffer
-    // and it is a string tensor, need to explicitly call string(s)
-    // __dtor(s).
-    if (IsDataTypeString()) {
-      using string = std::string;
-      auto* ptr = static_cast<std::string*>(p_data_);
-      int64_t len = shape_.Size();
-      for (int64_t i = 0; i < len; i++)
-        ptr[i].~string();
-    }
-    buffer_deleter_->Free(p_data_);
+  auto dit = deleters_.begin();
+  while (dit != deleters_.end()) {
+    (*dit)();
+    deleters_.erase(dit);
+    dit = deleters_.begin();
   }
 }
 

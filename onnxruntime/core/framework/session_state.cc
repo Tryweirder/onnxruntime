@@ -1004,8 +1004,11 @@ Status SessionState::FinalizeSessionStateImpl(const std::basic_string<PATH_CHAR_
   MemoryInfo::GenerateTensorMap(GetExecutionPlan(), GetOrtValueNameIdxMap());
 #endif
 
+  const auto disable_prepacking =
+      session_options.GetConfigOrDefault(kOrtSessionOptionsConfigDisablePrepacking, "0");
+  const bool trace_tensor_alloc = enable_mem_pattern_ && disable_prepacking == "1";
   std::unique_ptr<ITensorAllocator> tensor_allocator(
-      ITensorAllocator::Create(enable_mem_pattern_, *p_seq_exec_plan_, *this, weights_buffers_));
+      ITensorAllocator::Create(trace_tensor_alloc, *p_seq_exec_plan_, *this, weights_buffers_));
 
   const auto& initializer_allocation_order = p_seq_exec_plan_->initializer_allocation_order;
 
@@ -1032,9 +1035,6 @@ Status SessionState::FinalizeSessionStateImpl(const std::basic_string<PATH_CHAR_
   }
 
   ORT_RETURN_IF_ERROR(CreateKernels(kernel_registry_manager));
-
-  const auto disable_prepacking =
-      session_options.GetConfigOrDefault(kOrtSessionOptionsConfigDisablePrepacking, "0");
 
   if (disable_prepacking != "1") {
     ORT_RETURN_IF_ERROR(PrepackConstantInitializedTensors(constant_initializers_use_count));
